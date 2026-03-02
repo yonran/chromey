@@ -1079,3 +1079,228 @@ pub enum TargetMessage {
     /// Enable/Disable internal request paused interception
     EnableInterception(bool),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handler::browser::BrowserContext;
+    use chromiumoxide_cdp::cdp::browser_protocol::network::LoaderId;
+    use chromiumoxide_cdp::cdp::browser_protocol::page::{
+        CrossOriginIsolatedContextType, Frame as CdpFrame, FrameId, FrameTree, GatedApiFeatures,
+        SecureContextType,
+    };
+    use futures::channel::oneshot;
+    use futures::{pin_mut, task::noop_waker, FutureExt};
+    use std::task::Context;
+
+    fn make_target() -> Target {
+        let info = TargetInfo::builder()
+            .target_id("target-1".to_string())
+            .r#type("page")
+            .title("")
+            .url("about:blank")
+            .attached(false)
+            .can_access_opener(false)
+            .build()
+            .expect("target info");
+        let mut target = Target::new(info, TargetConfig::default(), BrowserContext::default());
+        target.set_session_id("session-1".to_string().into());
+        target.init_state = TargetInit::Initialized;
+        target
+    }
+
+    fn make_target_without_session() -> Target {
+        let mut target = make_target();
+        target.session_id = None;
+        target
+    }
+
+    fn make_attached_target_without_session() -> Target {
+        let info = TargetInfo::builder()
+            .target_id("target-1".to_string())
+            .r#type("page")
+            .title("")
+            .url("about:blank")
+            .attached(true)
+            .can_access_opener(false)
+            .build()
+            .expect("target info");
+        let mut target = Target::new(info, TargetConfig::default(), BrowserContext::default());
+        target.init_state = TargetInit::Initialized;
+        target
+    }
+
+    fn make_initializing_target(with_session: bool) -> Target {
+        let mut target = make_target();
+        target.init_state = TargetInit::InitializingFrame(FrameManager::init_commands(
+            target.config.request_timeout,
+        ));
+        if !with_session {
+            target.session_id = None;
+        }
+        target
+    }
+
+    fn frame_tree(frame_id: &FrameId, url: &str) -> FrameTree {
+        let frame = CdpFrame::builder()
+            .id(frame_id.clone())
+            .loader_id(LoaderId::new("loader-1"))
+            .url(url)
+            .domain_and_registry("")
+            .security_origin("://")
+            .mime_type("text/html")
+            .secure_context_type(SecureContextType::InsecureScheme)
+            .cross_origin_isolated_context_type(CrossOriginIsolatedContextType::NotIsolated)
+            .gated_api_features(Vec::<GatedApiFeatures>::new())
+            .build()
+            .expect("frame");
+        FrameTree::new(frame)
+    }
+
+    fn about_blank_frame_tree(frame_id: &FrameId) -> FrameTree {
+        frame_tree(frame_id, "about:blank")
+    }
+
+    #[test]
+    fn about_blank_page_creation_should_resolve_after_get_frame_tree() {
+        let frame_id = FrameId::new("frame-1");
+        let mut target = make_target();
+        target
+            .frame_manager_mut()
+            .on_frame_tree(about_blank_frame_tree(&frame_id));
+
+        let (tx, rx) = oneshot::channel();
+        target.set_initiator(tx);
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(target.poll(&mut cx, Instant::now()).is_none());
+
+        pin_mut!(rx);
+        let resolved = rx
+            .now_or_never()
+            .expect("about:blank page creation should resolve after GetFrameTree");
+        assert!(matches!(resolved, Ok(Ok(_))));
+    }
+
+    #[test]
+    fn page_creation_should_resolve_after_get_frame_tree_before_load() {
+        let frame_id = FrameId::new("frame-1");
+        let mut target = make_target();
+        target.info.url = "https://example.com/".to_string();
+        target
+            .frame_manager_mut()
+            .on_frame_tree(frame_tree(&frame_id, "https://example.com/"));
+
+        let (tx, rx) = oneshot::channel();
+        target.set_initiator(tx);
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            target.poll(&mut cx, Instant::now()).is_none(),
+            "current implementation keeps the initiator pending until load fires"
+        );
+
+        pin_mut!(rx);
+        let resolved = rx
+            .now_or_never()
+            .expect("page creation should resolve after the main frame exists, before load");
+        assert!(matches!(resolved, Ok(Ok(_))));
+    }
+
+    #[test]
+    fn loaded_about_blank_without_session_cannot_create_page_handle() {
+        let frame_id = FrameId::new("frame-1");
+        let mut target = make_target_without_session();
+        target
+            .frame_manager_mut()
+            .on_frame_tree(about_blank_frame_tree(&frame_id));
+        target.frame_manager_mut().on_frame_stopped_loading(
+            &chromiumoxide_cdp::cdp::browser_protocol::page::EventFrameStoppedLoading {
+                frame_id: frame_id.clone(),
+            },
+        );
+
+        assert!(
+            target.get_or_create_page().is_none(),
+            "without a session id, a loaded page target still cannot yield a Page handle"
+        );
+    }
+
+    #[test]
+    fn loaded_about_blank_with_session_can_create_page_handle() {
+        let frame_id = FrameId::new("frame-1");
+        let mut target = make_target();
+        target
+            .frame_manager_mut()
+            .on_frame_tree(about_blank_frame_tree(&frame_id));
+        target.frame_manager_mut().on_frame_stopped_loading(
+            &chromiumoxide_cdp::cdp::browser_protocol::page::EventFrameStoppedLoading {
+                frame_id: frame_id.clone(),
+            },
+        );
+
+        assert!(
+            target.get_or_create_page().is_some(),
+            "once both session and load are present, the target can materialize a Page handle"
+        );
+    }
+
+    #[test]
+    fn attached_target_info_should_be_usable_after_load() {
+        let frame_id = FrameId::new("frame-1");
+        let mut target = make_attached_target_without_session();
+        target
+            .frame_manager_mut()
+            .on_frame_tree(about_blank_frame_tree(&frame_id));
+        target.frame_manager_mut().on_frame_stopped_loading(
+            &chromiumoxide_cdp::cdp::browser_protocol::page::EventFrameStoppedLoading {
+                frame_id: frame_id.clone(),
+            },
+        );
+
+        let (tx, rx) = oneshot::channel();
+        target.set_initiator(tx);
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(target.poll(&mut cx, Instant::now()).is_none());
+
+        pin_mut!(rx);
+        let resolved = rx
+            .now_or_never()
+            .expect("an attached target reported by the browser should be usable after load");
+        assert!(matches!(resolved, Ok(Ok(_))));
+    }
+
+    #[test]
+    fn initializing_frame_without_session_emits_no_init_commands() {
+        let mut target = make_initializing_target(false);
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(
+            target.poll(&mut cx, Instant::now()).is_none(),
+            "initialization should stall immediately when session_id is missing"
+        );
+        assert!(
+            matches!(target.init_state, TargetInit::InitializingFrame(_)),
+            "the target should remain stuck in the frame-init state"
+        );
+    }
+
+    #[test]
+    fn initializing_frame_with_session_emits_init_commands() {
+        let mut target = make_initializing_target(true);
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let event = target.poll(&mut cx, Instant::now());
+
+        assert!(
+            matches!(event, Some(TargetEvent::Request(_))),
+            "once session_id is present, frame initialization should start emitting CDP requests"
+        );
+    }
+}
