@@ -560,13 +560,9 @@ impl Target {
             }
             TargetInit::Initialized => {
                 if let Some(initiator) = self.initiator.take() {
-                    // make sure that the main frame of the page has finished loading
-                    if self
-                        .frame_manager
-                        .main_frame()
-                        .map(|frame| frame.is_loaded())
-                        .unwrap_or_default()
-                    {
+                    // A page becomes usable once its main frame exists. Waiting for `load`
+                    // here conflates page creation with navigation completion.
+                    if self.frame_manager.main_frame().is_some() {
                         if let Some(page) = self.get_or_create_page() {
                             let _ = initiator.send(Ok(page.clone().into()));
                         } else {

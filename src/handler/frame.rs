@@ -855,6 +855,27 @@ impl AsRef<str> for LifecycleEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chromiumoxide_cdp::cdp::browser_protocol::network::LoaderId;
+    use chromiumoxide_cdp::cdp::browser_protocol::page::{
+        CrossOriginIsolatedContextType, EventFrameStoppedLoading, Frame as CdpFrame, FrameTree,
+        GatedApiFeatures, SecureContextType,
+    };
+
+    fn about_blank_frame_tree(frame_id: &FrameId) -> FrameTree {
+        let frame = CdpFrame::builder()
+            .id(frame_id.clone())
+            .loader_id(LoaderId::new("loader-1"))
+            .url("about:blank")
+            .domain_and_registry("")
+            .security_origin("://")
+            .mime_type("text/html")
+            .secure_context_type(SecureContextType::InsecureScheme)
+            .cross_origin_isolated_context_type(CrossOriginIsolatedContextType::NotIsolated)
+            .gated_api_features(Vec::<GatedApiFeatures>::new())
+            .build()
+            .expect("frame");
+        FrameTree::new(frame)
+    }
 
     #[test]
     fn frame_lifecycle_events_cleared_on_loading_started() {
@@ -877,5 +898,37 @@ mod tests {
 
         frame.on_loading_stopped();
         assert!(frame.is_loaded());
+    }
+
+    #[test]
+    fn about_blank_frame_tree_creates_main_frame_but_not_loaded() {
+        let frame_id = FrameId::new("frame-1");
+        let mut manager = FrameManager::new(Duration::from_secs(1));
+
+        manager.on_frame_tree(about_blank_frame_tree(&frame_id));
+
+        let main = manager.main_frame().expect("main frame");
+        assert_eq!(main.id(), &frame_id);
+        assert_eq!(main.url(), Some("about:blank"));
+        assert!(
+            !main.is_loaded(),
+            "GetFrameTree alone does not mark an about:blank main frame as loaded"
+        );
+    }
+
+    #[test]
+    fn about_blank_frame_tree_becomes_loaded_after_frame_stopped_loading() {
+        let frame_id = FrameId::new("frame-1");
+        let mut manager = FrameManager::new(Duration::from_secs(1));
+
+        manager.on_frame_tree(about_blank_frame_tree(&frame_id));
+        manager.on_frame_stopped_loading(&EventFrameStoppedLoading {
+            frame_id: frame_id.clone(),
+        });
+
+        assert!(
+            manager.main_frame().expect("main frame").is_loaded(),
+            "a later frameStoppedLoading event is what marks the about:blank frame as loaded"
+        );
     }
 }
