@@ -122,6 +122,24 @@ fn maybe_store_attach_session_id(target: &mut Target, method: &MethodId, resp: &
     }
 }
 
+fn upsert_target(
+    targets: &mut hashbrown::HashMap<TargetId, Target>,
+    target_ids: &mut Vec<TargetId>,
+    target_info: TargetInfo,
+    target_config: TargetConfig,
+    browser_ctx: BrowserContext,
+) {
+    let target_id = target_info.target_id.clone();
+    if let Some(existing) = targets.get_mut(&target_id) {
+        existing.update_info(target_info);
+        return;
+    }
+
+    let target = Target::new(target_info, target_config, browser_ctx);
+    target_ids.push(target.target_id().clone());
+    targets.insert(target.target_id().clone(), target);
+}
+
 impl Handler {
     /// Create a new `Handler` that drives the connection and listens for
     /// messages on the receiver `rx`.
@@ -465,32 +483,32 @@ impl Handler {
             .clone()
             .map(BrowserContext::from)
             .unwrap_or_else(|| self.default_browser_context.clone());
-        let target = Target::new(
+        let target_config = TargetConfig {
+            ignore_https_errors: self.config.ignore_https_errors,
+            request_timeout: self.config.request_timeout,
+            viewport: self.config.viewport.clone(),
+            request_intercept: self.config.request_intercept,
+            cache_enabled: self.config.cache_enabled,
+            service_worker_enabled: self.config.service_worker_enabled,
+            ignore_visuals: self.config.ignore_visuals,
+            ignore_stylesheets: self.config.ignore_stylesheets,
+            ignore_javascript: self.config.ignore_javascript,
+            ignore_analytics: self.config.ignore_analytics,
+            ignore_prefetch: self.config.ignore_prefetch,
+            extra_headers: self.config.extra_headers.clone(),
+            only_html: self.config.only_html && self.config.created_first_target,
+            intercept_manager: self.config.intercept_manager,
+            max_bytes_allowed: self.config.max_bytes_allowed,
+            whitelist_patterns: self.config.whitelist_patterns.clone(),
+            blacklist_patterns: self.config.blacklist_patterns.clone(),
+        };
+        upsert_target(
+            &mut self.targets,
+            &mut self.target_ids,
             event.target_info,
-            TargetConfig {
-                ignore_https_errors: self.config.ignore_https_errors,
-                request_timeout: self.config.request_timeout,
-                viewport: self.config.viewport.clone(),
-                request_intercept: self.config.request_intercept,
-                cache_enabled: self.config.cache_enabled,
-                service_worker_enabled: self.config.service_worker_enabled,
-                ignore_visuals: self.config.ignore_visuals,
-                ignore_stylesheets: self.config.ignore_stylesheets,
-                ignore_javascript: self.config.ignore_javascript,
-                ignore_analytics: self.config.ignore_analytics,
-                ignore_prefetch: self.config.ignore_prefetch,
-                extra_headers: self.config.extra_headers.clone(),
-                only_html: self.config.only_html && self.config.created_first_target,
-                intercept_manager: self.config.intercept_manager,
-                max_bytes_allowed: self.config.max_bytes_allowed,
-                whitelist_patterns: self.config.whitelist_patterns.clone(),
-                blacklist_patterns: self.config.blacklist_patterns.clone(),
-            },
+            target_config,
             browser_ctx,
         );
-
-        self.target_ids.push(target.target_id().clone());
-        self.targets.insert(target.target_id().clone(), target);
     }
 
     /// A new session is attached to a target
@@ -913,7 +931,7 @@ mod tests {
     #[test]
     fn attach_to_target_response_sets_session_id_before_event_arrives() {
         let info = TargetInfo::builder()
-            .target_id("target-1")
+            .target_id("target-1".to_string())
             .r#type("page")
             .title("")
             .url("about:blank")
@@ -924,9 +942,10 @@ mod tests {
         let mut target = Target::new(info, TargetConfig::default(), BrowserContext::default());
         let method = AttachToTargetParams::IDENTIFIER.into();
         let result =
-            serde_json::to_value(AttachToTargetReturns::new("session-1")).expect("attach result");
+            serde_json::to_value(AttachToTargetReturns::new("session-1".to_string()))
+                .expect("attach result");
         let resp = Response {
-            id: 1,
+            id: CallId::new(1),
             result: Some(result),
             error: None,
         };
@@ -938,5 +957,46 @@ mod tests {
             Some("session-1"),
             "attach response should seed the flat session id even before Target.attachedToTarget"
         );
+    }
+
+    #[test]
+    fn upsert_target_updates_info_without_replacing_target() {
+        let info = TargetInfo::builder()
+            .target_id("target-1".to_string())
+            .r#type("page")
+            .title("old")
+            .url("about:blank")
+            .attached(false)
+            .can_access_opener(false)
+            .build()
+            .expect("target info");
+        let mut target = Target::new(info, TargetConfig::default(), BrowserContext::default());
+        target.set_session_id("session-1".to_string().into());
+        let mut targets = hashbrown::HashMap::new();
+        let mut target_ids = vec![TargetId::new("target-1")];
+        targets.insert(TargetId::new("target-1"), target);
+
+        let updated = TargetInfo::builder()
+            .target_id("target-1".to_string())
+            .r#type("page")
+            .title("new")
+            .url("https://example.com/")
+            .attached(true)
+            .can_access_opener(false)
+            .build()
+            .expect("updated target info");
+        upsert_target(
+            &mut targets,
+            &mut target_ids,
+            updated,
+            TargetConfig::default(),
+            BrowserContext::default(),
+        );
+
+        let target = targets.get(&TargetId::new("target-1")).expect("target preserved");
+        assert_eq!(target.session_id().map(AsRef::as_ref), Some("session-1"));
+        assert_eq!(target.info().title, "new");
+        assert_eq!(target.info().url, "https://example.com/");
+        assert_eq!(target_ids, vec![TargetId::new("target-1")]);
     }
 }

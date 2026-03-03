@@ -287,6 +287,11 @@ impl Target {
         &self.info
     }
 
+    /// Refresh target metadata without replacing live page/session state.
+    pub fn update_info(&mut self, info: TargetInfo) {
+        self.info = info;
+    }
+
     /// Get the target that opened this target. Top-level targets return `None`.
     pub fn opener_id(&self) -> Option<&TargetId> {
         self.info.opener_id.as_ref()
