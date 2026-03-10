@@ -777,8 +777,12 @@ impl Target {
                             params,
                         }))
                     }
-                    NetworkEvent::Request(_) => {}
-                    NetworkEvent::Response(_) => {}
+                    NetworkEvent::Request(event) => {
+                        self.event_listeners.start_send(event);
+                    }
+                    NetworkEvent::Response(event) => {
+                        self.event_listeners.start_send(event);
+                    }
                     NetworkEvent::RequestFailed(request) => {
                         self.frame_manager.on_http_request_finished(request);
                     }
@@ -1085,14 +1089,76 @@ pub enum TargetMessage {
 mod tests {
     use super::*;
     use crate::handler::browser::BrowserContext;
-    use chromiumoxide_cdp::cdp::browser_protocol::network::LoaderId;
+    use crate::listeners::{EventListenerRequest, EventStream};
+    use chromiumoxide_cdp::cdp::browser_protocol::network::{
+        EventRequestWillBeSent, EventResponseReceived, LoaderId,
+    };
     use chromiumoxide_cdp::cdp::browser_protocol::page::{
         CrossOriginIsolatedContextType, Frame as CdpFrame, FrameId, FrameTree, GatedApiFeatures,
         SecureContextType,
     };
     use futures::channel::oneshot;
-    use futures::{pin_mut, task::noop_waker, FutureExt};
+    use futures::channel::mpsc::unbounded;
+    use futures::{pin_mut, task::noop_waker, FutureExt, StreamExt};
     use std::task::Context;
+
+    fn request_will_be_sent_event() -> EventRequestWillBeSent {
+        serde_json::from_value(serde_json::json!({
+            "requestId": "84477.1",
+            "loaderId": "loader-1",
+            "documentURL": "about:blank",
+            "request": {
+                "url": "http://127.0.0.1:64994/api/echo",
+                "method": "POST",
+                "headers": {
+                    "content-type": "text/plain"
+                },
+                "initialPriority": "High",
+                "mixedContentType": "none",
+                "referrerPolicy": "strict-origin-when-cross-origin"
+            },
+            "timestamp": 4366801.810859,
+            "wallTime": 1741631506.689501,
+            "initiator": {
+                "type": "script"
+            },
+            "redirectHasExtraInfo": false,
+            "type": "Fetch",
+            "frameId": "frame-1",
+            "hasUserGesture": false
+        }))
+        .expect("request event")
+    }
+
+    fn response_received_event() -> EventResponseReceived {
+        serde_json::from_value(serde_json::json!({
+            "requestId": "84477.1",
+            "loaderId": "loader-1",
+            "timestamp": 4366801.810971,
+            "type": "Fetch",
+            "response": {
+                "url": "http://127.0.0.1:64994/api/echo",
+                "status": 200,
+                "statusText": "OK",
+                "headers": {
+                    "Content-Type": "application/json"
+                },
+                "mimeType": "application/json",
+                "charset": "",
+                "connectionReused": false,
+                "connectionId": 183,
+                "fromDiskCache": false,
+                "fromServiceWorker": false,
+                "fromPrefetchCache": false,
+                "encodedDataLength": 180,
+                "protocol": "http/1.1",
+                "securityState": "secure"
+            },
+            "hasExtraInfo": true,
+            "frameId": "frame-1"
+        }))
+        .expect("response event")
+    }
 
     fn make_target() -> Target {
         let info = TargetInfo::builder()
@@ -1182,6 +1248,50 @@ mod tests {
             .now_or_never()
             .expect("about:blank page creation should resolve after GetFrameTree");
         assert!(matches!(resolved, Ok(Ok(_))));
+    }
+
+    #[test]
+    fn poll_forwards_network_request_events_to_target_listeners() {
+        let mut target = make_target();
+        let (tx, rx) = unbounded();
+        target
+            .event_listeners_mut()
+            .add_listener(EventListenerRequest::new::<EventRequestWillBeSent>(tx));
+        target
+            .network_manager
+            .on_request_will_be_sent(&request_will_be_sent_event());
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(target.poll(&mut cx, Instant::now()).is_none());
+        target.event_listeners_mut().poll(&mut cx);
+
+        let mut stream = EventStream::<EventRequestWillBeSent>::new(rx);
+        let event = futures::executor::block_on(stream.next()).expect("request event");
+        assert_eq!(event.request_id.as_ref(), "84477.1");
+        assert_eq!(event.request.method, "POST");
+    }
+
+    #[test]
+    fn poll_forwards_network_response_events_to_target_listeners() {
+        let mut target = make_target();
+        let (tx, rx) = unbounded();
+        target
+            .event_listeners_mut()
+            .add_listener(EventListenerRequest::new::<EventResponseReceived>(tx));
+        target
+            .network_manager
+            .on_response_received(&response_received_event());
+
+        let waker = noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        assert!(target.poll(&mut cx, Instant::now()).is_none());
+        target.event_listeners_mut().poll(&mut cx);
+
+        let mut stream = EventStream::<EventResponseReceived>::new(rx);
+        let event = futures::executor::block_on(stream.next()).expect("response event");
+        assert_eq!(event.request_id.as_ref(), "84477.1");
+        assert_eq!(event.response.status, 200);
     }
 
     #[test]

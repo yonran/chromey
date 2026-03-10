@@ -112,14 +112,14 @@ lazy_static::lazy_static! {
     };
 }
 
-fn maybe_store_attach_session_id(target: &mut Target, method: &MethodId, resp: &Response) {
+fn maybe_store_attach_session_id(method: &MethodId, resp: &Response) -> Option<SessionId> {
     if method.as_ref() != AttachToTargetParams::IDENTIFIER {
-        return;
+        return None;
     }
 
-    if let Ok(resp) = to_command_response::<AttachToTargetParams>(resp.clone(), method.clone()) {
-        target.set_session_id(resp.result.session_id);
-    }
+    to_command_response::<AttachToTargetParams>(resp.clone(), method.clone())
+        .ok()
+        .map(|resp| resp.result.session_id)
 }
 
 fn upsert_target(
@@ -293,7 +293,11 @@ impl Handler {
                 }
                 PendingRequest::InternalCommand(target_id) => {
                     if let Some(target) = self.targets.get_mut(&target_id) {
-                        maybe_store_attach_session_id(target, &method, &resp);
+                        if let Some(session_id) = maybe_store_attach_session_id(&method, &resp) {
+                            target.set_session_id(session_id.clone());
+                            self.sessions
+                                .insert(session_id.clone(), Session::new(session_id, target_id));
+                        }
                         target.on_response(resp, method.as_ref());
                     }
                 }
@@ -445,6 +449,14 @@ impl Handler {
                 if let Some(target) = self.targets.get_mut(session.target_id()) {
                     return target.on_event(event);
                 }
+            }
+
+            if let Some((_, target)) = self
+                .targets
+                .iter_mut()
+                .find(|(_, target)| target.session_id().map(AsRef::as_ref) == Some(session_id))
+            {
+                return target.on_event(event);
             }
         }
         let CdpEventMessage { params, method, .. } = event;
@@ -941,16 +953,17 @@ mod tests {
             .expect("target info");
         let mut target = Target::new(info, TargetConfig::default(), BrowserContext::default());
         let method = AttachToTargetParams::IDENTIFIER.into();
-        let result =
-            serde_json::to_value(AttachToTargetReturns::new("session-1".to_string()))
-                .expect("attach result");
+        let result = serde_json::to_value(AttachToTargetReturns::new("session-1".to_string()))
+            .expect("attach result");
         let resp = Response {
             id: CallId::new(1),
             result: Some(result),
             error: None,
         };
 
-        maybe_store_attach_session_id(&mut target, &method, &resp);
+        let session_id = maybe_store_attach_session_id(&method, &resp)
+            .expect("attach response should carry a session id");
+        target.set_session_id(session_id);
 
         assert_eq!(
             target.session_id().map(AsRef::as_ref),
@@ -993,7 +1006,9 @@ mod tests {
             BrowserContext::default(),
         );
 
-        let target = targets.get(&TargetId::new("target-1")).expect("target preserved");
+        let target = targets
+            .get(&TargetId::new("target-1"))
+            .expect("target preserved");
         assert_eq!(target.session_id().map(AsRef::as_ref), Some("session-1"));
         assert_eq!(target.info().title, "new");
         assert_eq!(target.info().url, "https://example.com/");

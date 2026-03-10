@@ -1,10 +1,9 @@
-use super::blockers::{
-    block_websites::block_xhr,
-    ignore_script_embedded, ignore_script_xhr, ignore_script_xhr_media,
-    xhr::IGNORE_XHR_ASSETS,
-};
 #[cfg(any(feature = "adblock", feature = "firewall"))]
 use super::blockers::block_websites::block_ads;
+use super::blockers::{
+    block_websites::block_xhr, ignore_script_embedded, ignore_script_xhr, ignore_script_xhr_media,
+    xhr::IGNORE_XHR_ASSETS,
+};
 use crate::auth::Credentials;
 #[cfg(feature = "_cache")]
 use crate::cache::BasicCachePolicy;
@@ -17,8 +16,8 @@ use chromiumoxide_cdp::cdp::browser_protocol::fetch::{RequestPattern, RequestSta
 use chromiumoxide_cdp::cdp::browser_protocol::network::{
     EmulateNetworkConditionsByRuleParams, EventLoadingFailed, EventLoadingFinished,
     EventRequestServedFromCache, EventRequestWillBeSent, EventResponseReceived, Headers,
-    InterceptionId, NetworkConditions, RequestId, ResourceType, Response,
-    SetCacheDisabledParams, SetExtraHttpHeadersParams,
+    InterceptionId, NetworkConditions, RequestId, ResourceType, Response, SetCacheDisabledParams,
+    SetExtraHttpHeadersParams,
 };
 use chromiumoxide_cdp::cdp::browser_protocol::{
     fetch::{
@@ -1314,6 +1313,9 @@ impl NetworkManager {
             self.set_block_all(true);
         }
 
+        self.queued_events
+            .push_back(NetworkEvent::Response(event.clone()));
+
         if let Some(mut request) = self.requests.remove(event.request_id.as_ref()) {
             request.set_response(event.response.clone());
             self.queued_events.push_back(if request_failed {
@@ -1408,7 +1410,7 @@ impl NetworkManager {
 
         self.requests.insert(event.request_id.clone(), request);
         self.queued_events
-            .push_back(NetworkEvent::Request(event.request_id.clone()));
+            .push_back(NetworkEvent::Request(event.clone()));
     }
 
     /// Handle request redirect.
@@ -1426,9 +1428,9 @@ pub enum NetworkEvent {
     /// Send a CDP request.
     SendCdpRequest((MethodId, serde_json::Value)),
     /// Request.
-    Request(RequestId),
+    Request(EventRequestWillBeSent),
     /// Response
-    Response(RequestId),
+    Response(EventResponseReceived),
     /// Request failed.
     RequestFailed(HttpRequest),
     /// Request finished.

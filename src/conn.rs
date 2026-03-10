@@ -206,26 +206,78 @@ fn decode_message<T: EventMessage>(
     bytes: &[u8],
     raw_text_for_logging: Option<&str>,
 ) -> Result<Box<Message<T>>> {
-    match serde_json::from_slice::<Box<Message<T>>>(bytes) {
-        Ok(msg) => {
-            tracing::trace!("Received {:?}", msg);
-            Ok(msg)
-        }
-        Err(err) => {
-            if let Some(txt) = raw_text_for_logging {
-                let preview = &txt[..txt.len().min(512)];
-                tracing::debug!(
-                    target: "chromiumoxide::conn::raw_ws::parse_errors",
-                    msg_len = txt.len(),
-                    "Skipping unrecognized WS message {err} preview={preview}",
+    let _ = raw_text_for_logging;
+    let value: serde_json::Value = serde_json::from_slice(bytes)?;
+    let msg = if value.get("method").is_some() {
+        Message::Event(serde_json::from_value::<T>(value)?)
+    } else {
+        Message::Response(serde_json::from_value::<chromiumoxide_types::Response>(
+            value,
+        )?)
+    };
+    tracing::trace!("Received {:?}", msg);
+    Ok(Box::new(msg))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_message;
+    use chromiumoxide_cdp::cdp::{CdpEvent, CdpEventMessage};
+    use chromiumoxide_types::Message;
+
+    #[test]
+    fn decode_message_parses_network_event_frames_by_shape() {
+        let raw = r#"{
+            "method":"Network.requestWillBeSentExtraInfo",
+            "params":{
+                "requestId":"84477.1",
+                "associatedCookies":[],
+                "headers":{
+                    "Accept":"*/*",
+                    "Content-Length":"17",
+                    "content-type":"text/plain"
+                },
+                "connectTiming":{
+                    "requestTime":4366801.0
+                },
+                "siteHasCookieInOtherPartition":false
+            },
+            "sessionId":"1005A6C7B1F1C90A7D2CEB10EA82E560"
+        }"#;
+
+        let message = decode_message::<CdpEventMessage>(raw.as_bytes(), Some(raw))
+            .expect("network event should decode");
+        match *message {
+            Message::Event(CdpEventMessage {
+                params: CdpEvent::NetworkRequestWillBeSentExtraInfo(event),
+                ..
+            }) => {
+                assert_eq!(event.request_id.as_ref(), "84477.1");
+                assert_eq!(
+                    event.headers.inner()["content-type"].as_str(),
+                    Some("text/plain")
                 );
-            } else {
-                tracing::debug!(
-                    target: "chromiumoxide::conn::raw_ws::parse_errors",
-                    "Skipping unrecognized binary WS message {err}",
+                assert!(
+                    event.client_security_state.is_none(),
+                    "missing clientSecurityState should stay optional"
                 );
             }
-            Err(err.into())
+            other => panic!("expected Network.requestWillBeSentExtraInfo event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decode_message_parses_command_responses_by_shape() {
+        let raw = r#"{"id":35,"result":{"postData":"{\"hello\":\"world\"}","base64Encoded":false},"sessionId":"session-1"}"#;
+
+        let message = decode_message::<CdpEventMessage>(raw.as_bytes(), Some(raw))
+            .expect("response frame should decode");
+        match *message {
+            Message::Response(response) => {
+                assert_eq!(response.id, chromiumoxide_types::CallId::new(35));
+                assert!(response.result.is_some());
+            }
+            other => panic!("expected response message, got {other:?}"),
         }
     }
 }
@@ -239,32 +291,15 @@ fn decode_message<T: EventMessage>(
     raw_text_for_logging: Option<&str>,
 ) -> Result<Box<Message<T>>> {
     use serde::Deserialize;
+    let _ = raw_text_for_logging;
     let mut de = serde_json::Deserializer::from_slice(bytes);
-
     de.disable_recursion_limit();
-
-    let de = serde_stacker::Deserializer::new(&mut de);
-
-    match Box::<Message<T>>::deserialize(de) {
-        Ok(msg) => {
-            tracing::trace!("Received {:?}", msg);
-            Ok(msg)
-        }
-        Err(err) => {
-            if let Some(txt) = raw_text_for_logging {
-                let preview = &txt[..txt.len().min(512)];
-                tracing::debug!(
-                    target: "chromiumoxide::conn::raw_ws::parse_errors",
-                    msg_len = txt.len(),
-                    "Skipping unrecognized WS message {err} preview={preview}",
-                );
-            } else {
-                tracing::debug!(
-                    target: "chromiumoxide::conn::raw_ws::parse_errors",
-                    "Skipping unrecognized binary WS message {err}",
-                );
-            }
-            Err(err.into())
-        }
-    }
+    let value = serde_stacker::deserialize::<serde_json::Value>(&mut de)?;
+    let msg = if value.get("method").is_some() {
+        Message::Event(T::deserialize(value)?)
+    } else {
+        Message::Response(chromiumoxide_types::Response::deserialize(value)?)
+    };
+    tracing::trace!("Received {:?}", msg);
+    Ok(Box::new(msg))
 }

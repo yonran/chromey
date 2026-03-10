@@ -73429,8 +73429,12 @@ pub mod browser_protocol {
             #[serde(deserialize_with = "super::super::de::deserialize_from_str")]
             pub initiator_ip_address_space: IpAddressSpace,
             #[serde(rename = "localNetworkAccessRequestPolicy")]
-            #[serde(deserialize_with = "super::super::de::deserialize_from_str")]
-            pub local_network_access_request_policy: LocalNetworkAccessRequestPolicy,
+            #[serde(
+                default,
+                skip_serializing_if = "Option::is_none",
+                deserialize_with = "super::super::de::deserialize_from_str_optional"
+            )]
+            pub local_network_access_request_policy: Option<LocalNetworkAccessRequestPolicy>,
         }
         impl ClientSecurityState {
             pub fn new(
@@ -73441,7 +73445,9 @@ pub mod browser_protocol {
                 Self {
                     initiator_is_secure_context: initiator_is_secure_context.into(),
                     initiator_ip_address_space: initiator_ip_address_space.into(),
-                    local_network_access_request_policy: local_network_access_request_policy.into(),
+                    local_network_access_request_policy: Some(
+                        local_network_access_request_policy.into(),
+                    ),
                 }
             }
         }
@@ -73497,14 +73503,7 @@ pub mod browser_protocol {
                             )
                         },
                     )?,
-                    local_network_access_request_policy: self
-                        .local_network_access_request_policy
-                        .ok_or_else(|| {
-                        format!(
-                            "Field `{}` is mandatory.",
-                            std::stringify!(local_network_access_request_policy)
-                        )
-                    })?,
+                    local_network_access_request_policy: self.local_network_access_request_policy,
                 })
             }
         }
