@@ -11,7 +11,7 @@ use chromiumoxide_cdp::cdp::browser_protocol::page::{
     EventFrameStartedLoading, EventFrameStoppedLoading, EventLifecycleEvent,
     EventNavigatedWithinDocument, Frame as CdpFrame, FrameTree,
 };
-use chromiumoxide_cdp::cdp::browser_protocol::target::EventAttachedToTarget;
+use chromiumoxide_cdp::cdp::browser_protocol::target::{EventAttachedToTarget, SessionId};
 use chromiumoxide_cdp::cdp::js_protocol::runtime::*;
 use chromiumoxide_cdp::cdp::{
     browser_protocol::page::{self, FrameId},
@@ -87,6 +87,8 @@ pub struct Frame {
     lifecycle_events: HashSet<MethodId>,
     /// The isolated world name.
     isolated_world_name: String,
+    /// The CDP session that owns this frame's contexts and commands.
+    owner_session_id: Option<SessionId>,
 }
 
 impl Frame {
@@ -105,6 +107,7 @@ impl Frame {
             name: None,
             lifecycle_events: Default::default(),
             isolated_world_name,
+            owner_session_id: None,
         }
     }
 
@@ -122,6 +125,7 @@ impl Frame {
             name: None,
             lifecycle_events: Default::default(),
             isolated_world_name: parent.isolated_world_name.clone(),
+            owner_session_id: parent.owner_session_id.clone(),
         }
     }
 
@@ -216,6 +220,14 @@ impl Frame {
         self.main_world.execution_context()
     }
 
+    pub fn owner_session_id(&self) -> Option<&SessionId> {
+        self.owner_session_id.as_ref()
+    }
+
+    pub fn set_owner_session_id(&mut self, session_id: Option<SessionId>) {
+        self.owner_session_id = session_id;
+    }
+
     pub fn set_request(&mut self, request: HttpRequest) {
         self.http_request = Some(Arc::new(request))
     }
@@ -227,6 +239,7 @@ impl Frame {
 #[derive(Debug)]
 pub struct FrameManager {
     main_frame: Option<FrameId>,
+    main_session_id: Option<SessionId>,
     frames: HashMap<FrameId, Frame>,
     /// The contexts mapped with their frames
     context_ids: HashMap<String, FrameId>,
@@ -244,6 +257,7 @@ impl FrameManager {
     pub fn new(request_timeout: Duration) -> Self {
         FrameManager {
             main_frame: None,
+            main_session_id: None,
             frames: Default::default(),
             context_ids: Default::default(),
             isolated_worlds: Default::default(),
@@ -320,6 +334,21 @@ impl FrameManager {
 
     pub fn frame(&self, id: &FrameId) -> Option<&Frame> {
         self.frames.get(id)
+    }
+
+    pub fn frame_session_id(&self, id: &FrameId) -> Option<SessionId> {
+        self.frames
+            .get(id)
+            .and_then(|frame| frame.owner_session_id().cloned())
+    }
+
+    pub fn set_main_session_id(&mut self, session_id: SessionId) {
+        self.main_session_id = Some(session_id.clone());
+        if let Some(main_frame_id) = &self.main_frame {
+            if let Some(frame) = self.frames.get_mut(main_frame_id) {
+                frame.set_owner_session_id(Some(session_id));
+            }
+        }
     }
 
     fn check_lifecycle(&self, watcher: &NavigationWatcher, frame: &Frame) -> bool {
@@ -420,8 +449,30 @@ impl FrameManager {
     }
 
     /// Fired when a frame moved to another session
-    pub fn on_attached_to_target(&mut self, _event: &EventAttachedToTarget) {
-        // _onFrameMoved
+    pub fn on_attached_to_target(&mut self, event: &EventAttachedToTarget) {
+        if event.target_info.r#type != "iframe" {
+            return;
+        }
+
+        let frame_id = FrameId::from(event.target_info.target_id.as_ref().to_string());
+        if let Some(frame) = self.frames.get_mut(&frame_id) {
+            frame.set_owner_session_id(Some(event.session_id.clone()));
+            return;
+        }
+
+        let Some(parent_frame_id) = event.target_info.parent_frame_id.clone() else {
+            return;
+        };
+        let Some(parent_frame) = self.frames.get_mut(&parent_frame_id) else {
+            return;
+        };
+
+        let mut frame = Frame::with_parent(frame_id.clone(), parent_frame);
+        frame.set_owner_session_id(Some(event.session_id.clone()));
+        self.frames.insert(frame_id, frame);
+    }
+    pub fn on_detached_remote_frame(&mut self, frame_id: &FrameId) {
+        self.remove_frames_recursively(frame_id);
     }
 
     pub fn on_frame_tree(&mut self, frame_tree: FrameTree) {
@@ -443,13 +494,21 @@ impl FrameManager {
         }
         if let Some(parent_frame_id) = parent_frame_id {
             if let Some(parent_frame) = self.frames.get_mut(&parent_frame_id) {
-                let frame = Frame::with_parent(frame_id.clone(), parent_frame);
+                let mut frame = Frame::with_parent(frame_id.clone(), parent_frame);
+                frame.set_owner_session_id(parent_frame.owner_session_id().cloned());
                 self.frames.insert(frame_id, frame);
             }
         }
     }
 
     pub fn on_frame_detached(&mut self, event: &EventFrameDetached) {
+        if matches!(event.reason, page::FrameDetachedReason::Swap) {
+            // Chromium emits a detach when a local iframe is swapped into an
+            // out-of-process iframe. Keep the frame identity alive and let the
+            // owning session move over, matching Playwright's OOPIF handling in
+            // crPage.ts / frames.ts.
+            return;
+        }
         self.remove_frames_recursively(&event.frame_id);
     }
 
@@ -472,13 +531,18 @@ impl FrameManager {
                     // this is necessary since we can't borrow mut and then remove recursively
                     main_frame.child_frames.clear();
                     main_frame.id = frame.id.clone();
+                    main_frame.set_owner_session_id(self.main_session_id.clone());
                     main_frame
                 } else {
-                    Frame::new(frame.id.clone())
+                    let mut frame_entry = Frame::new(frame.id.clone());
+                    frame_entry.set_owner_session_id(self.main_session_id.clone());
+                    frame_entry
                 }
             } else {
                 // initial main frame navigation
-                Frame::new(frame.id.clone())
+                let mut frame_entry = Frame::new(frame.id.clone());
+                frame_entry.set_owner_session_id(self.main_session_id.clone());
+                frame_entry
             };
             f.navigated(frame);
             self.main_frame = Some(f.id.clone());
@@ -857,9 +921,10 @@ mod tests {
     use super::*;
     use chromiumoxide_cdp::cdp::browser_protocol::network::LoaderId;
     use chromiumoxide_cdp::cdp::browser_protocol::page::{
-        CrossOriginIsolatedContextType, EventFrameStoppedLoading, Frame as CdpFrame, FrameTree,
-        GatedApiFeatures, SecureContextType,
+        CrossOriginIsolatedContextType, EventFrameDetached, EventFrameStoppedLoading,
+        Frame as CdpFrame, FrameDetachedReason, FrameTree, GatedApiFeatures, SecureContextType,
     };
+    use chromiumoxide_cdp::cdp::browser_protocol::target::{EventAttachedToTarget, TargetInfo};
 
     fn about_blank_frame_tree(frame_id: &FrameId) -> FrameTree {
         let frame = CdpFrame::builder()
@@ -929,6 +994,42 @@ mod tests {
         assert!(
             manager.main_frame().expect("main frame").is_loaded(),
             "a later frameStoppedLoading event is what marks the about:blank frame as loaded"
+        );
+    }
+
+    #[test]
+    fn swap_detach_keeps_remote_frame_alive() {
+        let main_frame_id = FrameId::new("main-frame");
+        let child_frame_id = FrameId::new("child-frame");
+        let mut manager = FrameManager::new(Duration::from_secs(1));
+
+        manager.on_frame_tree(about_blank_frame_tree(&main_frame_id));
+        manager.on_frame_attached(child_frame_id.clone(), Some(main_frame_id.clone()));
+        manager.on_attached_to_target(&EventAttachedToTarget {
+            session_id: SessionId::new("child-session"),
+            target_info: TargetInfo::builder()
+                .target_id(child_frame_id.as_ref().to_string())
+                .r#type("iframe")
+                .title("")
+                .url("http://localhost/frame-child")
+                .attached(true)
+                .can_access_opener(false)
+                .parent_frame_id(main_frame_id.as_ref().to_string())
+                .build()
+                .expect("target info"),
+            waiting_for_debugger: false,
+        });
+
+        manager.on_frame_detached(&EventFrameDetached {
+            frame_id: child_frame_id.clone(),
+            reason: FrameDetachedReason::Swap,
+        });
+
+        let child = manager.frame(&child_frame_id).expect("child frame should remain");
+        assert_eq!(
+            child.owner_session_id().map(AsRef::as_ref),
+            Some("child-session"),
+            "swap detaches should preserve the remote frame session mapping"
         );
     }
 }

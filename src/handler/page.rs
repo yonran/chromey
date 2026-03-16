@@ -37,7 +37,7 @@ use crate::error::{CdpError, Result};
 use crate::handler::commandfuture::CommandFuture;
 use crate::handler::domworld::DOMWorldKind;
 use crate::handler::httpfuture::HttpFuture;
-use crate::handler::target::{GetExecutionContext, TargetMessage};
+use crate::handler::target::{GetExecutionContext, GetFrameSession, TargetMessage};
 use crate::handler::target_message_future::TargetMessageFuture;
 use crate::js::EvaluationResult;
 use crate::layout::{Delta, Point, ScrollBehavior};
@@ -92,15 +92,40 @@ impl PageInner {
         execute(cmd, self.sender.clone(), Some(self.session_id.clone())).await
     }
 
+    pub(crate) async fn execute_with_session<T: Command>(
+        &self,
+        cmd: T,
+        session_id: SessionId,
+    ) -> Result<CommandResponse<T::Response>> {
+        execute(cmd, self.sender.clone(), Some(session_id)).await
+    }
+
     /// Execute a PDL command without waiting for the response.
     pub(crate) async fn send_command<T: Command>(&self, cmd: T) -> Result<&Self> {
         let _ = send_command(cmd, self.sender.clone(), Some(self.session_id.clone())).await;
         Ok(self)
     }
 
+    pub(crate) async fn send_command_with_session<T: Command>(
+        &self,
+        cmd: T,
+        session_id: SessionId,
+    ) -> Result<&Self> {
+        let _ = send_command(cmd, self.sender.clone(), Some(session_id)).await;
+        Ok(self)
+    }
+
     /// Create a PDL command future
     pub(crate) fn command_future<T: Command>(&self, cmd: T) -> Result<CommandFuture<T>> {
         CommandFuture::new(cmd, self.sender.clone(), Some(self.session_id.clone()))
+    }
+
+    pub(crate) fn command_future_with_session<T: Command>(
+        &self,
+        cmd: T,
+        session_id: SessionId,
+    ) -> Result<CommandFuture<T>> {
+        CommandFuture::new(cmd, self.sender.clone(), Some(session_id))
     }
 
     /// This creates navigation future with the final http response when the page is loaded
@@ -135,6 +160,15 @@ impl PageInner {
     /// The identifier of this page's target's session
     pub fn session_id(&self) -> &SessionId {
         &self.session_id
+    }
+
+    pub async fn frame_session_id(&self, frame_id: Option<FrameId>) -> Result<Option<SessionId>> {
+        let (tx, rx) = oneshot_channel();
+        self.sender
+            .clone()
+            .send(TargetMessage::FrameSession(GetFrameSession { frame_id, tx }))
+            .await?;
+        Ok(rx.await?)
     }
 
     /// The identifier of this page's target's opener target

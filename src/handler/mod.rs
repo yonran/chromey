@@ -295,8 +295,10 @@ impl Handler {
                     if let Some(target) = self.targets.get_mut(&target_id) {
                         if let Some(session_id) = maybe_store_attach_session_id(&method, &resp) {
                             target.set_session_id(session_id.clone());
-                            self.sessions
-                                .insert(session_id.clone(), Session::new(session_id, target_id));
+                            self.sessions.insert(
+                                session_id.clone(),
+                                Session::new(session_id, target_id.clone(), target_id),
+                            );
                         }
                         target.on_response(resp, method.as_ref());
                     }
@@ -444,9 +446,27 @@ impl Handler {
 
     /// Process an incoming event read from the websocket
     fn on_event(&mut self, event: CdpEventMessage) {
+        let parent_session_id = event.session_id.clone().map(SessionId::from);
+        let process_globally_first = matches!(
+            event.params,
+            CdpEvent::TargetAttachedToTarget(_) | CdpEvent::TargetDetachedFromTarget(_)
+        );
+
+        if process_globally_first {
+            match &event.params {
+                CdpEvent::TargetAttachedToTarget(ev) => {
+                    self.on_attached_to_target(ev.clone(), parent_session_id.clone());
+                }
+                CdpEvent::TargetDetachedFromTarget(ev) => {
+                    self.on_detached_from_target(ev.clone());
+                }
+                _ => {}
+            }
+        }
+
         if let Some(session_id) = &event.session_id {
             if let Some(session) = self.sessions.get(session_id.as_str()) {
-                if let Some(target) = self.targets.get_mut(session.target_id()) {
+                if let Some(target) = self.targets.get_mut(session.owner_target_id()) {
                     return target.on_event(event);
                 }
             }
@@ -463,9 +483,17 @@ impl Handler {
 
         match params {
             CdpEvent::TargetTargetCreated(ref ev) => self.on_target_created(*ev.clone()),
-            CdpEvent::TargetAttachedToTarget(ref ev) => self.on_attached_to_target(ev.clone()),
+            CdpEvent::TargetAttachedToTarget(ref ev) => {
+                if !process_globally_first {
+                    self.on_attached_to_target(ev.clone(), parent_session_id);
+                }
+            }
             CdpEvent::TargetTargetDestroyed(ref ev) => self.on_target_destroyed(ev.clone()),
-            CdpEvent::TargetDetachedFromTarget(ref ev) => self.on_detached_from_target(ev.clone()),
+            CdpEvent::TargetDetachedFromTarget(ref ev) => {
+                if !process_globally_first {
+                    self.on_detached_from_target(ev.clone());
+                }
+            }
             _ => {}
         }
 
@@ -524,8 +552,21 @@ impl Handler {
     }
 
     /// A new session is attached to a target
-    fn on_attached_to_target(&mut self, event: Box<EventAttachedToTarget>) {
-        let session = Session::new(event.session_id.clone(), event.target_info.target_id);
+    fn on_attached_to_target(
+        &mut self,
+        event: Box<EventAttachedToTarget>,
+        parent_session_id: Option<SessionId>,
+    ) {
+        let owner_target_id = parent_session_id
+            .as_ref()
+            .and_then(|session_id| self.sessions.get(session_id.as_ref()))
+            .map(|session| session.owner_target_id().clone())
+            .unwrap_or_else(|| event.target_info.target_id.clone());
+        let session = Session::new(
+            event.session_id.clone(),
+            event.target_info.target_id,
+            owner_target_id,
+        );
         if let Some(target) = self.targets.get_mut(session.target_id()) {
             target.set_session_id(session.session_id().clone())
         }

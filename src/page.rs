@@ -13,8 +13,7 @@ use chromiumoxide_cdp::cdp::browser_protocol::input::{
     DispatchDragEventType, DispatchMouseEventParams, DispatchMouseEventType, DragData, MouseButton,
 };
 use chromiumoxide_cdp::cdp::browser_protocol::network::{
-    BlockPattern, Cookie, CookieParam, DeleteCookiesParams, GetCookiesParams,
-    SetBlockedUrLsParams,
+    BlockPattern, Cookie, CookieParam, DeleteCookiesParams, GetCookiesParams, SetBlockedUrLsParams,
     SetCookiesParams, SetExtraHttpHeadersParams, SetUserAgentOverrideParams, TimeSinceEpoch,
 };
 use chromiumoxide_cdp::cdp::browser_protocol::page::*;
@@ -388,15 +387,40 @@ impl Page {
         self.command_future(cmd)?.await
     }
 
+    pub async fn execute_with_session<T: Command>(
+        &self,
+        cmd: T,
+        session_id: SessionId,
+    ) -> Result<CommandResponse<T::Response>> {
+        self.inner.execute_with_session(cmd, session_id).await
+    }
+
     /// Execute a command without waiting for a response.
     pub async fn send_command<T: Command>(&self, cmd: T) -> Result<&Self> {
         let _ = self.inner.send_command(cmd).await;
         Ok(self)
     }
 
+    pub async fn send_command_with_session<T: Command>(
+        &self,
+        cmd: T,
+        session_id: SessionId,
+    ) -> Result<&Self> {
+        let _ = self.inner.send_command_with_session(cmd, session_id).await;
+        Ok(self)
+    }
+
     /// Execute a command and return the `Command::Response`
     pub fn command_future<T: Command>(&self, cmd: T) -> Result<CommandFuture<T>> {
         self.inner.command_future(cmd)
+    }
+
+    pub fn command_future_with_session<T: Command>(
+        &self,
+        cmd: T,
+        session_id: SessionId,
+    ) -> Result<CommandFuture<T>> {
+        self.inner.command_future_with_session(cmd, session_id)
     }
 
     /// Execute a command and return the `Command::Response`
@@ -1069,6 +1093,10 @@ impl Page {
             .send(TargetMessage::Parent(GetParent { frame_id, tx }))
             .await?;
         Ok(rx.await?)
+    }
+
+    pub async fn frame_session_id(&self, frame_id: FrameId) -> Result<Option<SessionId>> {
+        self.inner.frame_session_id(Some(frame_id)).await
     }
 
     /// Return the main frame of the page
@@ -2850,6 +2878,28 @@ impl Page {
         evaluate: impl Into<EvaluateParams>,
     ) -> Result<EvaluationResult> {
         self.inner.evaluate_expression(evaluate).await
+    }
+
+    pub async fn evaluate_expression_with_session(
+        &self,
+        evaluate: impl Into<EvaluateParams>,
+        session_id: SessionId,
+    ) -> Result<EvaluationResult> {
+        let mut evaluate = evaluate.into();
+        if evaluate.await_promise.is_none() {
+            evaluate.await_promise = Some(true);
+        }
+        if evaluate.return_by_value.is_none() {
+            evaluate.return_by_value = Some(true);
+        }
+
+        let resp = self.execute_with_session(evaluate, session_id).await?.result;
+
+        if let Some(exception) = resp.exception_details {
+            return Err(CdpError::JavascriptException(Box::new(exception)));
+        }
+
+        Ok(EvaluationResult::new(resp.result))
     }
 
     /// Evaluates an expression or function in the page's context and returns

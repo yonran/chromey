@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
@@ -29,8 +29,10 @@ use crate::{page::Page, ArcHttpRequest};
 use chromiumoxide_cdp::cdp::browser_protocol::{
     browser::BrowserContextId,
     log as cdplog,
-    page::{FrameId, GetFrameTreeParams},
-    target::{AttachToTargetParams, SessionId, SetAutoAttachParams, TargetId, TargetInfo},
+    page::{EnableParams, FrameId, GetFrameTreeParams, SetLifecycleEventsEnabledParams},
+    target::{
+        AttachToTargetParams, SessionId, SetAutoAttachParams, TargetId, TargetInfo,
+    },
 };
 use chromiumoxide_cdp::cdp::events::CdpEvent;
 use chromiumoxide_cdp::cdp::js_protocol::runtime::{
@@ -124,6 +126,8 @@ pub struct Target {
     emulation_manager: EmulationManager,
     /// The identifier of the session this target is attached to
     session_id: Option<SessionId>,
+    /// Child iframe sessions whose page/runtime events belong to this page target.
+    child_sessions: HashMap<SessionId, FrameId>,
     /// The handle of the browser page of this target
     page: Option<PageHandle>,
     /// Drives this target towards initialization
@@ -190,6 +194,7 @@ impl Target {
             network_manager,
             emulation_manager: EmulationManager::new(request_timeout),
             session_id: None,
+            child_sessions: Default::default(),
             page: None,
             init_state: TargetInit::AttachToTarget,
             wait_for_frame_navigation: Default::default(),
@@ -204,6 +209,7 @@ impl Target {
 
     /// Set the session id.
     pub fn set_session_id(&mut self, id: SessionId) {
+        self.frame_manager.set_main_session_id(id.clone());
         self.session_id = Some(id)
     }
 
@@ -365,12 +371,16 @@ impl Target {
                 None => return,
             };
 
-            let self_sid: &str = match self.session_id.as_ref() {
-                Some(sid) => sid.as_ref(),
-                None => return,
-            };
+            let belongs_to_target = self
+                .session_id
+                .as_ref()
+                .is_some_and(|sid| sid.as_ref() == ev_sid)
+                || self
+                    .child_sessions
+                    .iter()
+                    .any(|(sid, _)| sid.as_ref() == ev_sid);
 
-            if self_sid != ev_sid {
+            if !belongs_to_target {
                 return;
             }
         }
@@ -409,6 +419,36 @@ impl Target {
             }
             // `Target` events
             CdpEvent::TargetAttachedToTarget(ev) => {
+                self.frame_manager.on_attached_to_target(ev);
+                if ev.target_info.r#type == "iframe" {
+                    self.child_sessions.insert(
+                        ev.session_id.clone(),
+                        FrameId::from(ev.target_info.target_id.as_ref().to_string()),
+                    );
+                    let page_enable = EnableParams::default();
+                    let get_tree = GetFrameTreeParams::default();
+                    let set_lifecycle = SetLifecycleEventsEnabledParams::new(true);
+                    for (method, params) in [
+                        (
+                            page_enable.identifier(),
+                            serde_json::to_value(page_enable).unwrap_or_default(),
+                        ),
+                        (
+                            get_tree.identifier(),
+                            serde_json::to_value(get_tree).unwrap_or_default(),
+                        ),
+                        (
+                            set_lifecycle.identifier(),
+                            serde_json::to_value(set_lifecycle).unwrap_or_default(),
+                        ),
+                    ] {
+                        self.queued_events.push_back(TargetEvent::Request(Request {
+                            method,
+                            session_id: Some(ev.session_id.clone().into()),
+                            params,
+                        }));
+                    }
+                }
                 if ev.waiting_for_debugger {
                     let runtime_cmd = ATTACH_TARGET.clone();
 
@@ -433,6 +473,11 @@ impl Target {
                             params,
                         }));
                     }
+                }
+            }
+            CdpEvent::TargetDetachedFromTarget(ev) => {
+                if let Some(frame_id) = self.child_sessions.remove(&ev.session_id) {
+                    self.frame_manager.on_detached_remote_frame(&frame_id);
                 }
             }
             // `NetworkManager` events
@@ -649,11 +694,13 @@ impl Target {
                                 tx.send(self.frame_manager.main_frame().map(|f| f.id().clone()));
                         }
                         TargetMessage::AllFrames(tx) => {
+                            let frames = self
+                                .frame_manager
+                                .frames()
+                                .map(|f| f.id().clone())
+                                .collect::<Vec<_>>();
                             let _ = tx.send(
-                                self.frame_manager
-                                    .frames()
-                                    .map(|f| f.id().clone())
-                                    .collect(),
+                                frames,
                             );
                         }
                         #[cfg(feature = "_cache")]
@@ -683,6 +730,14 @@ impl Target {
                             let GetParent { frame_id, tx } = req;
                             let frame = self.frame_manager.frame(&frame_id);
                             let _ = tx.send(frame.and_then(|f| f.parent_id().cloned()));
+                        }
+                        TargetMessage::FrameSession(req) => {
+                            let GetFrameSession { frame_id, tx } = req;
+                            let session_id = frame_id
+                                .as_ref()
+                                .and_then(|frame_id| self.frame_manager.frame_session_id(frame_id))
+                                .or_else(|| self.session_id.clone());
+                            let _ = tx.send(session_id);
                         }
                         TargetMessage::WaitForNavigation(tx) => {
                             if let Some(frame) = self.frame_manager.main_frame() {
@@ -1051,6 +1106,14 @@ pub struct GetParent {
 }
 
 #[derive(Debug)]
+pub struct GetFrameSession {
+    /// The id of the frame to get the owning session for (None = main frame)
+    pub frame_id: Option<FrameId>,
+    /// Sender half of the channel to send the response back
+    pub tx: Sender<Option<SessionId>>,
+}
+
+#[derive(Debug)]
 pub enum TargetMessage {
     /// Execute a command within the session of this target
     Command(CommandMessage),
@@ -1067,6 +1130,8 @@ pub enum TargetMessage {
     Name(GetName),
     /// Return the parent id of a frame
     Parent(GetParent),
+    /// Return the owning session for a frame
+    FrameSession(GetFrameSession),
     /// A Message that resolves when the frame finished loading a new url
     WaitForNavigation(Sender<ArcHttpRequest>),
     /// A Message that resolves when the frame network is idle
